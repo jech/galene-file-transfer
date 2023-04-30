@@ -1,0 +1,30 @@
+An implementation of Galene's peer-to-peer file transfer protocol for the
+command line.
+
+This is not required in order to transfer files: the file transfer
+protocol is usually invoked from Galene's web interface.  However, it may
+be convienient in order to transfer files larger than the browser can
+handle, or in environments where a full web browser is not available.
+
+# Building
+
+    git clone https://github.com/jech/galene-file-transfer
+    cd galene-file-transfer
+    CGO_ENABLED=0 go build
+
+# Sending files
+
+    galene-file-transfer -to jch \
+                         https://galene.org:8443/group/public/ \
+                         filename
+
+# Receiving files
+
+    galene-file-transfer https://galene.org:8443/group/public/
+
+The program will normally exit after one file transfer.  In order to
+receive multiple files, use the `-persist` option.
+
+For more information, type
+
+    galene-file-transfer -help
