@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"bytes"
 	crand "crypto/rand"
 	"crypto/tls"
@@ -9,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -153,6 +153,17 @@ func main() {
 	}
 	defer ws.Close()
 
+	endpoint := status.Endpoint
+	if endpoint == "" {
+		log.Println("Warning: endpoint not found, " +
+			"perhaps the server is very old?")
+		endpoint = (&url.URL{
+			Scheme: group.Scheme,
+			Host:   group.Host,
+			Path:   "/ws",
+		}).String()
+	}
+
 	writer := newWriter[*clientMessage]()
 	go writerLoop(ws, writer)
 
@@ -163,7 +174,7 @@ func main() {
 
 	writer.write(&clientMessage{
 		Type:    "handshake",
-		Version: []string{"2"},
+		Version: []string{"2", "1"},
 		Id:      myId,
 	})
 
