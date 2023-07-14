@@ -147,22 +147,15 @@ func main() {
 		}
 	}
 
+	if status.Endpoint == "" {
+		log.Fatalf("Server didn't provide endpoint.")
+	}
+
 	ws, _, err := dialer.Dial(status.Endpoint, nil)
 	if err != nil {
 		log.Fatalf("Connect to server: %v", err)
 	}
 	defer ws.Close()
-
-	endpoint := status.Endpoint
-	if endpoint == "" {
-		log.Println("Warning: endpoint not found, " +
-			"perhaps the server is very old?")
-		endpoint = (&url.URL{
-			Scheme: group.Scheme,
-			Host:   group.Host,
-			Path:   "/ws",
-		}).String()
-	}
 
 	writer := newWriter[*clientMessage]()
 	go writerLoop(ws, writer)
