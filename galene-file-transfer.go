@@ -257,9 +257,9 @@ outer:
 						Dest:   m.Source,
 						Kind:   "filetransfer",
 						Value: map[string]any{
-							"type": "abort",
+							"type": "cancel",
 							"id":   value["id"],
-							"value": "this peer " +
+							"message": "this peer " +
 								"does not" +
 								"receive files",
 						},
@@ -457,7 +457,6 @@ func getToken(server, group, username, password string) (string, error) {
 type transferKey struct {
 	id     string
 	peerId string
-	up     bool
 }
 
 type transferredFile struct {
@@ -489,7 +488,6 @@ func sendFile(writer *writer[*clientMessage], dest string, filename string) erro
 	key := transferKey{
 		id:     id,
 		peerId: dest,
-		up:     true,
 	}
 	tr := &transferredFile{
 		id:     id,
@@ -515,7 +513,6 @@ func receiveFile(writer *writer[*clientMessage], source string, value map[string
 	key := transferKey{
 		id:     id,
 		peerId: source,
-		up:     false,
 	}
 	tr := &transferredFile{
 		id:     id,
@@ -531,22 +528,13 @@ func receiveFile(writer *writer[*clientMessage], source string, value map[string
 }
 
 func gotMessage(writer *writer[*clientMessage], source string, value map[string]any) error {
-	tpe, ok := value["type"].(string)
-	if !ok {
-		return errors.New("Bad type for type")
-	}
 	id, ok := value["id"].(string)
 	if !ok {
 		return errors.New("Bad type for id")
 	}
-	up := false
-	if tpe == "offer" || tpe == "reject" || tpe == "downice" {
-		up = true
-	}
 	key := transferKey{
 		id:     id,
 		peerId: source,
-		up:     up,
 	}
 	t, ok := transferring.Load(key)
 	if !ok {
@@ -554,6 +542,19 @@ func gotMessage(writer *writer[*clientMessage], source string, value map[string]
 	}
 	tr := t.(*transferredFile)
 	return tr.writer.write(value)
+}
+
+func contains(s []any, v string) bool {
+	for i := range s {
+		w, ok := s[i].(string)
+		if !ok {
+			continue
+		}
+		if v == w {
+			return true
+		}
+	}
+	return false
 }
 
 func receiveLoop(writer *writer[*clientMessage], tr *transferredFile, m map[string]any) error {
@@ -569,13 +570,14 @@ func receiveLoop(writer *writer[*clientMessage], tr *transferredFile, m map[stri
 
 	abort := func(message string) {
 		write(map[string]any{
-			"type":  "reject",
-			"id":    tr.id,
-			"value": message,
+			"type":    "cancel",
+			"id":      tr.id,
+			"message": message,
 		})
 	}
 
 	api := webrtc.NewAPI()
+	var protocolVersion string
 	var pc *webrtc.PeerConnection
 	var dc *webrtc.DataChannel
 	var file *os.File
@@ -605,6 +607,17 @@ func receiveLoop(writer *writer[*clientMessage], tr *transferredFile, m map[stri
 		}
 		switch tpe {
 		case "invite":
+			v, ok := m["version"].([]any)
+			if ok && contains(v, "1") {
+				protocolVersion = "1"
+			} else {
+				abort(fmt.Sprintf(
+					"unknown protocol version %v", v,
+				))
+				return fmt.Errorf(
+					"unknown protocol version %v", v,
+				)
+			}
 			sz, ok := m["size"].(float64)
 			if !ok {
 				abort("bad type for size")
@@ -655,7 +668,7 @@ func receiveLoop(writer *writer[*clientMessage], tr *transferredFile, m map[stri
 					return
 				}
 				write(map[string]any{
-					"type":      "downice",
+					"type":      "ice",
 					"id":        tr.id,
 					"candidate": c.ToJSON(),
 				})
@@ -699,9 +712,10 @@ func receiveLoop(writer *writer[*clientMessage], tr *transferredFile, m map[stri
 				return err
 			}
 			write(map[string]any{
-				"type": "offer",
-				"id":   tr.id,
-				"sdp":  pc.LocalDescription().SDP,
+				"type":    "offer",
+				"version": []string{protocolVersion},
+				"id":      tr.id,
+				"sdp":     pc.LocalDescription().SDP,
 			})
 		case "answer":
 			sdp, ok := m["sdp"].(string)
@@ -716,7 +730,7 @@ func receiveLoop(writer *writer[*clientMessage], tr *transferredFile, m map[stri
 			if err != nil {
 				abort(err.Error())
 			}
-		case "upice":
+		case "ice":
 			if pc == nil {
 				log.Println("got candidate for null PC")
 				break
@@ -730,11 +744,11 @@ func receiveLoop(writer *writer[*clientMessage], tr *transferredFile, m map[stri
 				log.Printf("AddIceCandidate: %v", err)
 			}
 		case "cancel":
-			value, _ := m["value"].(string)
+			value, _ := m["message"].(string)
 			if value != "" {
-				return errors.New("canceled: " + value)
+				return errors.New("cancelled: " + value)
 			} else {
-				return errors.New("canceled")
+				return errors.New("cancelled")
 			}
 		default:
 			log.Println("unexpected", m["type"])
@@ -775,9 +789,9 @@ func sendLoop(writer *writer[*clientMessage], filename string, tr *transferredFi
 
 	abort := func(message string) {
 		write(map[string]any{
-			"type":  "cancel",
-			"id":    tr.id,
-			"value": message,
+			"type":    "cancel",
+			"id":      tr.id,
+			"message": message,
 		})
 	}
 
@@ -792,10 +806,11 @@ func sendLoop(writer *writer[*clientMessage], filename string, tr *transferredFi
 	}
 
 	err = write(map[string]any{
-		"type": "invite",
-		"id":   tr.id,
-		"name": filepath.Base(filename),
-		"size": fi.Size(),
+		"type":    "invite",
+		"version": []string{"1"},
+		"id":      tr.id,
+		"name":    filepath.Base(filename),
+		"size":    fi.Size(),
 	})
 	if err != nil {
 		return err
@@ -842,6 +857,16 @@ func sendLoop(writer *writer[*clientMessage], filename string, tr *transferredFi
 		}
 		switch tpe {
 		case "offer":
+			v, ok := m["version"].([]any)
+			if !ok || !contains(v, "1") {
+				abort(fmt.Sprintf(
+					"unknown protocol version %v", v,
+				))
+				return fmt.Errorf(
+					"unknown protocol version %v", v,
+				)
+			}
+
 			if pc != nil {
 				log.Println("Duplicate offer")
 				break
@@ -900,7 +925,7 @@ func sendLoop(writer *writer[*clientMessage], filename string, tr *transferredFi
 					return
 				}
 				write(map[string]any{
-					"type":      "upice",
+					"type":      "ice",
 					"id":        tr.id,
 					"candidate": c.ToJSON(),
 				})
@@ -931,7 +956,7 @@ func sendLoop(writer *writer[*clientMessage], filename string, tr *transferredFi
 				"id":   tr.id,
 				"sdp":  pc.LocalDescription().SDP,
 			})
-		case "downice":
+		case "ice":
 			if pc == nil {
 				log.Println("got candidate for null PC")
 				break
@@ -944,12 +969,12 @@ func sendLoop(writer *writer[*clientMessage], filename string, tr *transferredFi
 			if err != nil {
 				log.Printf("AddIceCandidate: %v", err)
 			}
-		case "reject":
-			value, _ := m["value"].(string)
+		case "cancel":
+			value, _ := m["message"].(string)
 			if value != "" {
-				return errors.New("rejected: " + value)
+				return errors.New("cancelled: " + value)
 			} else {
-				return errors.New("rejected")
+				return errors.New("cancelled")
 			}
 		default:
 			log.Println("unexpected", m["type"])
