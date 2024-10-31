@@ -68,7 +68,7 @@ type clientMessage struct {
 var myId string
 var client http.Client
 
-var outdir string
+var outfile string
 var rtcConfiguration *webrtc.Configuration
 var insecure, debug bool
 
@@ -87,8 +87,8 @@ func main() {
 		"`password` to use for login")
 	flag.StringVar(&toUsername, "to", "",
 		"`username` to send files to")
-	flag.StringVar(&outdir, "o", ".",
-		"`directory` to store files in")
+	flag.StringVar(&outfile, "o", "",
+		"output `filename` or directory")
 	flag.BoolVar(&persist, "persist", false,
 		"receive multiple files")
 	flag.BoolVar(&insecure, "insecure", false,
@@ -618,7 +618,19 @@ func receiveLoop(writer *writer[*clientMessage], tr *transferredFile, m map[stri
 				abort("bad type for filename")
 				return errors.New("bad type for filename")
 			}
-			filename = filepath.Join(outdir, filepath.Base(filename))
+			if outfile == "" {
+				filename = filepath.Base(filename)
+			} else {
+				fi, err := os.Stat(outfile)
+				if err == nil && fi.IsDir() {
+					filename = filepath.Join(
+						outfile,
+						filepath.Base(filename),
+					)
+				} else {
+					filename = outfile
+				}
+			}
 			var err error
 			file, err = os.OpenFile(
 				filename, os.O_WRONLY|os.O_CREATE|os.O_EXCL,
