@@ -227,10 +227,6 @@ outer:
 				break outer
 			}
 		case "usermessage":
-			if m.Dest != myId {
-				log.Println("Misdirected usermessage")
-				break
-			}
 			if m.Kind == "error" || m.Kind == "warning" {
 				log.Printf("%v: %v", m.Kind, m.Value)
 				break
