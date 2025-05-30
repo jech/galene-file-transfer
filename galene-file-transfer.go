@@ -2,9 +2,8 @@ package main
 
 import (
 	"bytes"
-	crand "crypto/rand"
+	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,65 +11,20 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"path"
 	"path/filepath"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/jech/gclient"
 	"github.com/pion/webrtc/v4"
 )
 
-type groupStatus struct {
-	Name        string `json:"name"`
-	Redirect    string `json:"redirect,omitempty"`
-	Location    string `json:"location,omitempty"`
-	Endpoint    string `json:"endpoint,omitempty"`
-	DisplayName string `json:"displayName,omitempty"`
-	Description string `json:"description,omitempty"`
-	AuthServer  string `json:"authServer,omitempty"`
-	AuthPortal  string `json:"authPortal,omitempty"`
-	Locked      bool   `json:"locked,omitempty"`
-	ClientCount *int   `json:"clientCount,omitempty"`
-}
-
-type clientMessage struct {
-	Type             string                   `json:"type"`
-	Version          []string                 `json:"version,omitempty"`
-	Kind             string                   `json:"kind,omitempty"`
-	Error            string                   `json:"error,omitempty"`
-	Id               string                   `json:"id,omitempty"`
-	Replace          string                   `json:"replace,omitempty"`
-	Source           string                   `json:"source,omitempty"`
-	Dest             string                   `json:"dest,omitempty"`
-	Username         *string                  `json:"username,omitempty"`
-	Password         string                   `json:"password,omitempty"`
-	Token            string                   `json:"token,omitempty"`
-	Privileged       bool                     `json:"privileged,omitempty"`
-	Permissions      []string                 `json:"permissions,omitempty"`
-	Status           *groupStatus             `json:"status,omitempty"`
-	Data             map[string]any           `json:"data,omitempty"`
-	Group            string                   `json:"group,omitempty"`
-	Value            any                      `json:"value,omitempty"`
-	NoEcho           bool                     `json:"noecho,omitempty"`
-	Time             string                   `json:"time,omitempty"`
-	SDP              string                   `json:"sdp,omitempty"`
-	Candidate        *webrtc.ICECandidateInit `json:"candidate,omitempty"`
-	Label            string                   `json:"label,omitempty"`
-	Request          any                      `json:"request,omitempty"`
-	RTCConfiguration *webrtc.Configuration    `json:"rtcConfiguration,omitempty"`
-}
-
-var myId string
-var client http.Client
-
 var outfile string
 var rtcConfiguration *webrtc.Configuration
-var insecure, debug bool
+var insecure bool
 
 func main() {
 	var username, password, toUsername string
@@ -93,7 +47,7 @@ func main() {
 		"receive multiple files")
 	flag.BoolVar(&insecure, "insecure", false,
 		"don't check server certificates")
-	flag.BoolVar(&debug, "debug", false,
+	flag.BoolVar(&gclient.Debug, "debug", false,
 		"enable protocol logging")
 	flag.Parse()
 
@@ -114,90 +68,35 @@ func main() {
 		}
 	}
 
-	dialer := websocket.DefaultDialer
+	client := gclient.NewClient()
+
 	if insecure {
 		t := http.DefaultTransport.(*http.Transport).Clone()
 		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-		client.Transport = t
+		client.SetHTTPClient(&http.Client{
+			Transport: t,
+		})
 
-		d := *dialer
+		d := *websocket.DefaultDialer
 		d.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-		dialer = &d
+		client.SetDialer(&d)
 	}
 
-	group, err := url.Parse(flag.Arg(0))
+	err := client.Connect(context.Background(), flag.Arg(0))
 	if err != nil {
-		log.Fatalf("Parse group: %v", err)
+		log.Fatalf("Connect: %v", err)
 	}
-	token := group.Query().Get("token")
-	group.RawQuery = ""
-
-	status, err := getGroupStatus(group.String())
-	if err != nil {
-		log.Fatalf("Get group status: %v", err)
-	}
-
-	if token == "" && status.AuthServer != "" {
-		var err error
-		token, err = getToken(
-			status.AuthServer, group.String(), username, password,
-		)
-		if err != nil {
-			log.Fatalf("Get token: %v", err)
-		}
-	}
-
-	if status.Endpoint == "" {
-		log.Fatalf("Server didn't provide endpoint.")
-	}
-
-	ws, _, err := dialer.Dial(status.Endpoint, nil)
-	if err != nil {
-		log.Fatalf("Connect to server: %v", err)
-	}
-	defer ws.Close()
-
-	writer := newWriter[*clientMessage]()
-	go writerLoop(ws, writer)
-
-	readerCh := make(chan *clientMessage, 1)
-	go readerLoop(ws, readerCh)
-
-	myId = makeId()
-
-	writer.write(&clientMessage{
-		Type:    "handshake",
-		Version: []string{"2", "1"},
-		Id:      myId,
-	})
-
-	m := <-readerCh
-	if m == nil {
-		log.Fatal("Connection closed")
-		return
-	}
-	if m.Type != "handshake" {
-		log.Fatalf("Unexpected message %v", m.Type)
-	}
-
-	m = &clientMessage{
-		Type:     "join",
-		Kind:     "join",
-		Group:    status.Name,
-		Username: &username,
-	}
-	if token != "" {
-		m.Token = token
-	} else if password != "" {
-		// don't leak passwords if we obtained a token
-		m.Password = password
-	}
-	writer.write(m)
 
 	done := make(chan struct{})
-
 	terminate := make(chan os.Signal, 1)
 	signal.Notify(terminate, syscall.SIGINT, syscall.SIGTERM)
+
+	err = client.Join(
+		context.Background(), flag.Arg(0), username, password,
+	)
+	if err != nil {
+		log.Fatalf("Join: %v", err)
+	}
 
 	sent := false
 outer:
@@ -207,247 +106,100 @@ outer:
 			break outer
 		case <-done:
 			break outer
-		case m = <-readerCh:
-			if m == nil {
-				log.Println("Connection closed")
-				break outer
-			}
-		}
-
-		switch m.Type {
-		case "joined":
-			switch m.Kind {
-			case "fail":
-				log.Printf("Couldn't join: %v", m.Value)
-				break outer
-			case "join", "change":
-				rtcConfiguration = m.RTCConfiguration
-			case "leave":
-				rtcConfiguration = nil
-				break outer
-			}
-		case "usermessage":
-			if m.Kind == "error" || m.Kind == "warning" {
-				log.Printf("%v: %v", m.Kind, m.Value)
-				break
-			}
-			if m.Kind != "filetransfer" {
-				log.Println("Unexpected usermessage", m.Kind)
-				break
-			}
-			value, ok := m.Value.(map[string]any)
-			if !ok {
-				log.Println("Unexpected type for value")
-				break
-			}
-			tpe, ok := value["type"].(string)
-			if !ok {
-				log.Println("Unexpected type for type")
-				break
-			}
-			if tpe == "invite" {
-				if sending {
-					writer.write(&clientMessage{
-						Type:   "usermessage",
-						Source: myId,
-						Dest:   m.Source,
-						Kind:   "filetransfer",
-						Value: map[string]any{
+		case e := <-client.EventCh:
+			switch e := e.(type) {
+			case gclient.JoinedEvent:
+				if e.Kind == "failed" {
+					log.Printf("Join failed: %v", e.Value)
+					break outer
+				}
+			case gclient.UserMessageEvent:
+				if e.Kind == "error" || e.Kind == "warning" {
+					log.Printf("%v: %v", e.Kind, e.Value)
+					break
+				}
+				if e.Kind != "filetransfer" {
+					log.Println("Unexpected usermessage",
+						e.Kind)
+					break
+				}
+				value, ok := e.Value.(map[string]any)
+				if !ok {
+					log.Println("Unexpected type for value")
+					break
+				}
+				tpe, ok := value["type"].(string)
+				if !ok {
+					log.Println("Unexpected type for type")
+					break
+				}
+				if tpe == "invite" {
+					if sending {
+						v := map[string]any{
 							"type": "cancel",
 							"id":   value["id"],
 							"message": "this peer " +
 								"does not" +
 								"receive files",
-						},
-					})
-					continue outer
-				}
-				go func() {
-					err := receiveFile(
-						writer, m.Source, value,
-					)
-					if err != nil {
-						log.Printf("Receive: %v", err)
-					}
-					if !persist {
-						close(done)
-					}
-				}()
-			} else {
-				err := gotMessage(writer, m.Source, value)
-				if err != nil {
-					log.Printf("File transfer: %v", err)
-					break outer
-				}
-			}
-		case "user":
-			switch m.Kind {
-			case "delete":
-				abortTransfers(m.Id)
-			case "add", "change":
-				if m.Id == myId {
-					continue outer
-				}
-				if sending && !sent && m.Username != nil &&
-					*m.Username == toUsername {
-					sent = true
-					go func(filenames []string) {
-						sendFiles(
-							writer, m.Id, filenames,
+						}
+						client.UserMessage(
+							e.Source,
+							"filetransfer",
+							v,
 						)
+						continue outer
+					}
+					go func() {
+						err := receiveFile(
+							client, e.Source, value,
+						)
+						if err != nil {
+							log.Printf("Receive: %v", err)
+						}
 						if !persist {
 							close(done)
 						}
-					}(flag.Args()[1:])
+					}()
+				} else {
+					err := gotMessage(client, e.Source, value)
+					if err != nil {
+						log.Printf("File transfer: %v", err)
+						break outer
+					}
 				}
+			case gclient.UserEvent:
+				switch e.Kind {
+				case "delete":
+					abortTransfers(e.Id)
+				case "add", "change":
+					if e.Id == client.Id {
+						continue outer
+					}
+					if sending && !sent &&
+						e.Username == toUsername {
+						sent = true
+						go func(filenames []string) {
+							sendFiles(
+								client, e.Id,
+								filenames,
+							)
+							if !persist {
+								close(done)
+							}
+						}(flag.Args()[1:])
+					}
+				}
+			case gclient.DownConnEvent:
+				client.Abort(e.Id)
+			case error:
+				log.Printf("Protocol error: %v", e)
+				break outer
 			}
-		case "ping":
-			writer.write(&clientMessage{
-				Type: "pong",
-			})
 		}
 	}
 
 	abortTransfers("")
-	close(writer.ch)
-	<-writer.done
-}
-
-func debugf(fmt string, args ...interface{}) {
-	if debug {
-		log.Printf(fmt, args...)
-	}
-}
-
-func makeId() string {
-	rawId := make([]byte, 8)
-	crand.Read(rawId)
-	return base64.RawURLEncoding.EncodeToString(rawId)
-}
-
-func readerLoop(ws *websocket.Conn, ch chan<- *clientMessage) {
-	defer close(ch)
-	for {
-		var m clientMessage
-		err := ws.ReadJSON(&m)
-		if err != nil {
-			debugf("ReadJSON: %v", err)
-			return
-		}
-		if debug {
-			j, _ := json.Marshal(m)
-			debugf("<- %v", string(j))
-		}
-		ch <- &m
-	}
-}
-
-type writer[T any] struct {
-	ch   chan T
-	done chan struct{}
-}
-
-func newWriter[T any]() *writer[T] {
-	return &writer[T]{
-		ch:   make(chan T, 8),
-		done: make(chan struct{}),
-	}
-}
-
-func (writer *writer[T]) write(m T) error {
-	select {
-	case writer.ch <- m:
-		return nil
-	case <-writer.done:
-		return io.EOF
-	}
-}
-
-func writerLoop(ws *websocket.Conn, writer *writer[*clientMessage]) {
-	defer close(writer.done)
-	for {
-		m, ok := <-writer.ch
-		if !ok {
-			break
-		}
-		if debug {
-			j, _ := json.Marshal(m)
-			debugf("-> %v", string(j))
-		}
-		err := ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if err != nil {
-			debugf("Writer deadline: %v", err)
-			return
-		}
-		err = ws.WriteJSON(m)
-		if err != nil {
-			debugf("WriteJSON: %v", err)
-			return
-		}
-	}
-	ws.WriteControl(websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-		time.Now().Add(100*time.Millisecond),
-	)
-}
-
-func getGroupStatus(group string) (groupStatus, error) {
-	s, err := url.Parse(group)
-	if err != nil {
-		return groupStatus{}, err
-	}
-	s.Path = path.Join(s.Path, ".status.json")
-	s.RawPath = ""
-	resp, err := client.Get(s.String())
-	if err != nil {
-		return groupStatus{}, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return groupStatus{}, errors.New(resp.Status)
-	}
-
-	decoder := json.NewDecoder(resp.Body)
-	var status groupStatus
-	err = decoder.Decode(&status)
-	if err != nil {
-		return groupStatus{}, err
-	}
-	return status, nil
-}
-
-func getToken(server, group, username, password string) (string, error) {
-	request := map[string]any{
-		"username": username,
-		"location": group,
-		"password": password,
-	}
-	req, err := json.Marshal(request)
-	if err != nil {
-		return "", err
-	}
-	resp, err := client.Post(
-		server, "application/json", bytes.NewReader(req),
-	)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNoContent {
-		return "", nil
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", errors.New(resp.Status)
-	}
-
-	t, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(t), nil
+	client.Close()
 }
 
 type transferKey struct {
@@ -456,20 +208,20 @@ type transferKey struct {
 }
 
 type transferredFile struct {
-	id     string
-	peerId string
-	up     bool
-	writer *writer[any]
+	id      string
+	peerId  string
+	up      bool
+	writeCh chan map[string]any
 }
 
 var transferring sync.Map
 
-func sendFiles(writer *writer[*clientMessage], dest string, files []string) {
+func sendFiles(client *gclient.Client, dest string, files []string) {
 	var wg sync.WaitGroup
 	wg.Add(len(files))
 	for _, filename := range files {
 		go func(filename string) {
-			err := sendFile(writer, dest, filename)
+			err := sendFile(client, dest, filename)
 			if err != nil {
 				log.Printf("Send %v: %v", filename, err)
 			}
@@ -479,17 +231,17 @@ func sendFiles(writer *writer[*clientMessage], dest string, files []string) {
 	wg.Wait()
 }
 
-func sendFile(writer *writer[*clientMessage], dest string, filename string) error {
-	id := makeId()
+func sendFile(client *gclient.Client, dest string, filename string) error {
+	id := gclient.MakeId()
 	key := transferKey{
 		id:     id,
 		peerId: dest,
 	}
 	tr := &transferredFile{
-		id:     id,
-		peerId: dest,
-		up:     true,
-		writer: newWriter[any](),
+		id:      id,
+		peerId:  dest,
+		up:      true,
+		writeCh: make(chan map[string]any, 8),
 	}
 
 	_, loaded := transferring.LoadOrStore(key, tr)
@@ -498,10 +250,10 @@ func sendFile(writer *writer[*clientMessage], dest string, filename string) erro
 	}
 
 	defer transferring.Delete(tr.id)
-	return sendLoop(writer, filename, tr)
+	return sendLoop(client, filename, tr)
 }
 
-func receiveFile(writer *writer[*clientMessage], source string, value map[string]any) error {
+func receiveFile(client *gclient.Client, source string, value map[string]any) error {
 	id, ok := value["id"].(string)
 	if !ok {
 		return errors.New("Bad type for id")
@@ -511,19 +263,19 @@ func receiveFile(writer *writer[*clientMessage], source string, value map[string
 		peerId: source,
 	}
 	tr := &transferredFile{
-		id:     id,
-		peerId: source,
-		writer: newWriter[any](),
+		id:      id,
+		peerId:  source,
+		writeCh: make(chan map[string]any, 8),
 	}
 	_, loaded := transferring.LoadOrStore(key, tr)
 	if loaded {
 		return errors.New("duplicate transfer")
 	}
-	defer transferring.Delete(tr.id)
-	return receiveLoop(writer, tr, value)
+	defer transferring.Delete(key)
+	return receiveLoop(client, tr, value)
 }
 
-func gotMessage(writer *writer[*clientMessage], source string, value map[string]any) error {
+func gotMessage(client *gclient.Client, source string, value map[string]any) error {
 	id, ok := value["id"].(string)
 	if !ok {
 		return errors.New("Bad type for id")
@@ -537,7 +289,8 @@ func gotMessage(writer *writer[*clientMessage], source string, value map[string]
 		return errors.New("unknown transfer")
 	}
 	tr := t.(*transferredFile)
-	return tr.writer.write(value)
+	tr.writeCh <- value
+	return nil
 }
 
 func contains(s []any, v string) bool {
@@ -553,15 +306,13 @@ func contains(s []any, v string) bool {
 	return false
 }
 
-func receiveLoop(writer *writer[*clientMessage], tr *transferredFile, m map[string]any) error {
+func receiveLoop(client *gclient.Client, tr *transferredFile, m map[string]any) error {
 	write := func(v map[string]any) error {
-		return writer.write(&clientMessage{
-			Type:   "usermessage",
-			Source: myId,
-			Dest:   tr.peerId,
-			Kind:   "filetransfer",
-			Value:  v,
-		})
+		return client.UserMessage(
+			tr.peerId,
+			"filetransfer",
+			v,
+		)
 	}
 
 	abort := func(message string) {
@@ -590,7 +341,7 @@ func receiveLoop(writer *writer[*clientMessage], tr *transferredFile, m map[stri
 			file.Close()
 			file = nil
 		}
-		close(tr.writer.done)
+		close(tr.writeCh)
 	}()
 
 	ch := make(chan error, 8)
@@ -751,18 +502,14 @@ func receiveLoop(writer *writer[*clientMessage], tr *transferredFile, m map[stri
 		}
 
 		select {
-		case v, ok := <-tr.writer.ch:
+		case v, ok := <-tr.writeCh:
 			if !ok {
 				return nil
 			}
-			switch v := v.(type) {
-			case nil:
+			if v == nil {
 				return nil
-			case map[string]any:
-				m = v
-			default:
-				log.Println("Unexpected message", v)
 			}
+			m = v
 		case err := <-ch:
 			if err != nil {
 				abort(err.Error())
@@ -772,15 +519,13 @@ func receiveLoop(writer *writer[*clientMessage], tr *transferredFile, m map[stri
 	}
 }
 
-func sendLoop(writer *writer[*clientMessage], filename string, tr *transferredFile) error {
+func sendLoop(client *gclient.Client, filename string, tr *transferredFile) error {
 	write := func(v map[string]any) error {
-		return writer.write(&clientMessage{
-			Type:   "usermessage",
-			Source: myId,
-			Dest:   tr.peerId,
-			Kind:   "filetransfer",
-			Value:  v,
-		})
+		return client.UserMessage(
+			tr.peerId,
+			"filetransfer",
+			v,
+		)
 	}
 
 	abort := func(message string) {
@@ -827,18 +572,14 @@ func sendLoop(writer *writer[*clientMessage], filename string, tr *transferredFi
 	for {
 		var m map[string]any
 		select {
-		case v, ok := <-tr.writer.ch:
+		case v, ok := <-tr.writeCh:
 			if !ok {
 				return nil
 			}
-			switch v := v.(type) {
-			case nil:
+			if v == nil {
 				return nil
-			case map[string]any:
-				m = v
-			default:
-				log.Println("Unexpected message", v)
 			}
+			m = v
 		case err := <-ch:
 			if err != nil {
 				abort(err.Error())
@@ -997,7 +738,7 @@ func abortTransfers(id string) {
 		if id != "" && id != t.peerId {
 			return true
 		}
-		t.writer.write(nil)
+		t.writeCh <- nil
 		return true
 	})
 }
